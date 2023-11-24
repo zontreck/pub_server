@@ -1,7 +1,3 @@
-// Copyright (c) 2014, the Dart project authors.  Please see the AUTHORS file
-// for details. All rights reserved. Use of this source code is governed by a
-// BSD-style license that can be found in the LICENSE file.
-
 import 'dart:async';
 import 'dart:convert' as convert;
 import 'dart:io';
@@ -14,45 +10,35 @@ import 'package:yaml/yaml.dart';
 
 final Logger _logger = Logger('pub_server.file_repository');
 
-/// Implements the [PackageRepository] by storing pub packages on a file system.
 class FileRepository extends PackageRepository {
   final String baseDir;
 
   FileRepository(this.baseDir);
 
   @override
-  Stream<PackageVersion> versions(String package) {
+  Stream<PackageVersion> versions(String package) async* {
     var directory = Directory(p.join(baseDir, package));
     if (directory.existsSync()) {
-      return directory
-          .list(recursive: false)
-          .where((fse) => fse is Directory)
-          .map((dir) {
-        var version = p.basename(dir.path);
-        var pubspecFile = File(pubspecFilePath(package, version));
-        var tarballFile = File(packageTarballPath(package, version));
-        if (pubspecFile.existsSync() && tarballFile.existsSync()) {
-          var pubspec = pubspecFile.readAsStringSync();
-          return PackageVersion(package, version, pubspec);
+      await for (var dir in directory.list(recursive: false)) {
+        if (dir is Directory) {
+          var version = p.basename(dir.path);
+          var pubspecFile = File(pubspecFilePath(package, version));
+          var tarballFile = File(packageTarballPath(package, version));
+          if (pubspecFile.existsSync() && tarballFile.existsSync()) {
+            var pubspec = await pubspecFile.readAsString();
+            yield PackageVersion(package, version, pubspec);
+          }
         }
-        return null;
-      }).where((e) => e != null);
+      }
     }
-
-    return Stream.fromIterable([]);
   }
 
-  // TODO: Could be optimized by searching for the exact package/version
-  // combination instead of enumerating all.
   @override
-  Future<PackageVersion> lookupVersion(String package, String version) {
-    return versions(package)
+  Future<PackageVersion> lookupVersion(String package, String version) async {
+    var matchingVersions = await versions(package)
         .where((pv) => pv.versionString == version)
-        .toList()
-        .then((List<PackageVersion> versions) {
-      if (versions.isNotEmpty) return versions.first;
-      return null;
-    });
+        .toList();
+    return matchingVersions.isNotEmpty ? matchingVersions.first : null;
   }
 
   @override
@@ -61,25 +47,17 @@ class FileRepository extends PackageRepository {
   @override
   Future<PackageVersion> upload(Stream<List<int>> data) async {
     _logger.info('Start uploading package.');
-    var bb = await data.fold(
-        BytesBuilder(), (BytesBuilder byteBuilder, d) => byteBuilder..add(d));
-    var tarballBytes = bb.takeBytes();
+    var tarballBytes = await data
+        .fold<List<int>>(<int>[], (combined, data) => combined..addAll(data));
     var tarBytes = GZipDecoder().decodeBytes(tarballBytes);
     var archive = TarDecoder().decodeBytes(tarBytes);
-    ArchiveFile pubspecArchiveFile;
-    for (var file in archive.files) {
-      if (file.name == 'pubspec.yaml') {
-        pubspecArchiveFile = file;
-        break;
-      }
-    }
+    var pubspecArchiveFile = archive.files.firstWhere(
+        (file) => file.name == 'pubspec.yaml',
+        orElse: () =>
+            throw 'Did not find any pubspec.yaml file in upload. Aborting.');
 
-    if (pubspecArchiveFile == null) {
-      throw 'Did not find any pubspec.yaml file in upload. Aborting.';
-    }
-
-    // TODO: Error handling.
-    var pubspec = loadYaml(convert.utf8.decode(_getBytes(pubspecArchiveFile)));
+    var pubspec =
+        loadYaml(convert.utf8.decode(pubspecArchiveFile.content as List<int>));
 
     var package = pubspec['name'] as String;
     var version = pubspec['version'] as String;
@@ -95,7 +73,8 @@ class FileRepository extends PackageRepository {
       throw StateError('`$package` already exists at version `$version`.');
     }
 
-    var pubspecContent = convert.utf8.decode(_getBytes(pubspecArchiveFile));
+    var pubspecContent =
+        convert.utf8.decode(pubspecArchiveFile.content as List<int>);
     pubspecFile.writeAsStringSync(pubspecContent);
     File(packageTarballPath(package, version)).writeAsBytesSync(tarballBytes);
 
@@ -115,7 +94,7 @@ class FileRepository extends PackageRepository {
     if (pubspecFile.existsSync() && tarballFile.existsSync()) {
       return tarballFile.openRead();
     } else {
-      throw 'package cannot be downloaded, because it does not exist';
+      throw 'Package cannot be downloaded because it does not exist';
     }
   }
 
@@ -125,7 +104,3 @@ class FileRepository extends PackageRepository {
   String packageTarballPath(String package, String version) =>
       p.join(baseDir, package, version, 'package.tar.gz');
 }
-
-// Since pkg/archive v1.0.31, content is `dynamic` although in our use case
-// it's always `List<int>`
-List<int> _getBytes(ArchiveFile file) => file.content as List<int>;
